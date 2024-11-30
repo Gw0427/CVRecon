@@ -98,3 +98,89 @@ class Transformer(torch.nn.Module):
             x = layer(x, mask=mask_n)
 
         return x
+
+
+class CrossTransformer(torch.nn.Module):
+    def __init__(
+        self,
+        emb_dim,
+        mlp_dim,
+        num_layers=1,
+        num_heads=1,
+        dropout_rate=0.0,
+        attn_dropout_rate=0.0,
+    ):
+        super().__init__()
+
+        in_dim = emb_dim
+        self.encoder_layers = torch.nn.ModuleList()
+        for i in range(num_layers):
+            layer = CrossAttentionBlock(
+                in_dim, num_heads, mlp_dim, dropout_rate, attn_dropout_rate
+            )
+            self.encoder_layers.append(layer)
+
+        self.num_heads = num_heads
+
+    def forward(self, query, key, value, mask=None):
+        """
+        query: [1, n_voxels, in_channels] - Reference view features
+        key: [n_imgs-1, n_voxels, in_channels] - Source view features
+        value: [n_imgs-1, n_voxels, in_channels] - Source view features
+        mask: [n_voxels, n_imgs-1] - Attention mask
+        Returns: [1, n_voxels, in_channels] - Fused features
+        """
+
+        if self.num_heads > 1 and mask is not None:
+            n_voxels = mask.shape[0]
+            batch_size = mask.shape[2]
+
+            # 1. mask dimention [n_voxels, batch_size, batch_size]
+            mask = mask.squeeze(1)  # [n_voxels, batch_size]
+            mask = mask.unsqueeze(2).repeat(1, 1, batch_size)  # [n_voxels, batch_size, batch_size]
+
+            mask = mask.repeat_interleave(self.num_heads, dim=0)  # [n_voxels * num_heads, batch_size, batch_size]
+
+        x = query
+        for layer in self.encoder_layers:
+            x = layer(x, key, value, mask=mask)
+
+        return x
+
+# query: (seq_len_q, batch_size, in_dim)
+# key:  (seq_len_k, batch_size, in_dim)
+# value: (seq_len_k, batch_size, in_dim)
+class CrossAttentionBlock(torch.nn.Module):
+    def __init__(
+        self, in_dim, num_heads, mlp_dim, dropout_rate=0.0, attn_dropout_rate=0.0
+    ):
+        super().__init__()
+
+        self.norm1 = torch.nn.LayerNorm(in_dim)
+        self.cross_attn = torch.nn.MultiheadAttention(in_dim, num_heads)
+        if dropout_rate > 0:
+            self.dropout = torch.nn.Dropout(dropout_rate)
+        else:
+            self.dropout = None
+        self.norm2 = torch.nn.LayerNorm(in_dim)
+        self.mlp = MlpBlock(in_dim, mlp_dim, in_dim, dropout_rate)
+
+    def forward(self, query, key, value, mask=None):
+        residual = query
+        query = self.norm1(query)
+        # Cross attention between query (reference) and key/value (source) features
+        x, attn_weights = self.cross_attn(
+            query, key, value, 
+            attn_mask=mask,
+            need_weights=False
+        )
+        
+        if self.dropout is not None:
+            x = self.dropout(x)
+        x += residual
+        residual = x
+
+        x = self.norm2(x)
+        x = self.mlp(x)
+        x += residual
+        return x
